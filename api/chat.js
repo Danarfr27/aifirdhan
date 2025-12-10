@@ -33,6 +33,34 @@ async function lookupGeo(ip) {
   }
 }
 
+// Try to extract readable text from the model response object.
+function extractTextFromResponse(obj, maxLen = 8000) {
+  const parts = [];
+  const seen = new Set();
+  function walk(node) {
+    if (!node || parts.join('').length > maxLen) return;
+    if (typeof node === 'string') {
+      parts.push(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const v of node) walk(v);
+      return;
+    }
+    if (typeof node === 'object') {
+      // prefer common fields
+      const keys = ['text','content','output','message','response','candidates','outputs','results','items'];
+      for (const k of keys) {
+        if (node[k]) walk(node[k]);
+      }
+      // fallback to all values
+      for (const v of Object.values(node)) walk(v);
+    }
+  }
+  try { walk(obj); } catch (e) { /* ignore */ }
+  return parts.join(' ').slice(0, maxLen).trim();
+}
+
 async function appendLog(entry) {
   try {
     await fs.mkdir('./logs', { recursive: true });
@@ -148,6 +176,8 @@ export default async function handler(req, res) {
     try {
       const ip = getRequesterIp(req);
       const geo = await lookupGeo(ip).catch(() => null);
+      const responseText = extractTextFromResponse(finalData);
+
       const entry = {
         id: makeId(),
         timestamp: new Date().toISOString(),
@@ -163,8 +193,10 @@ export default async function handler(req, res) {
         request: {
           contents
         },
+        // include readable assistant reply and the full raw response for debugging
+        responseText: responseText || null,
+        responseFull: finalData,
         responseSummary: {
-          // store a small reference to the returned object (not entire blob)
           truncated: JSON.stringify(finalData).slice(0, 1000)
         }
       };
