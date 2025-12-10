@@ -3,7 +3,9 @@
 
 import fs from 'fs/promises';
 
-const LOGS_PATH = './logs/logs.json';
+// Prefer the received logs (forwarded from chatbot). Fall back to legacy `logs.json`.
+const PRIMARY_LOGS = './logs/received.json';
+const FALLBACK_LOGS = './logs/logs.json';
 
 export default async function handler(req, res) {
   // Allow only GET
@@ -18,7 +20,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    const raw = await fs.readFile(LOGS_PATH, 'utf8');
+    let raw = '[]';
+    try {
+      raw = await fs.readFile(PRIMARY_LOGS, 'utf8');
+    } catch (e) {
+      // if primary missing, try fallback
+      try { raw = await fs.readFile(FALLBACK_LOGS, 'utf8'); } catch (e2) { raw = '[]' }
+    }
     const all = JSON.parse(raw || '[]');
 
     // Support simple query params: limit, q (search id or country)
