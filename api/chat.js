@@ -1,6 +1,75 @@
 // Serverless function for Vercel with API Key Rotation Strategy
 // Supports fallback to multiple keys if one hits Rate Limit (429)
 
+import fs from 'fs/promises';
+
+const LOGS_PATH = './logs/logs.json';
+const GEO_IP_URL = (ip) => `http://ip-api.com/json/${ip}?fields=status,country,regionName,city,lat,lon,query,message,isp,org`;
+
+function getRequesterIp(req) {
+  const forwarded = req.headers['x-forwarded-for'] || req.headers['cf-connecting-ip'] || req.headers['x-real-ip'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  if (req.socket && req.socket.remoteAddress) return req.socket.remoteAddress;
+  return '';
+}
+
+function makeId() {
+  try {
+    if (globalThis && typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  } catch (e) {}
+  return `${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
+}
+
+async function lookupGeo(ip) {
+  if (!ip) return null;
+  try {
+    const r = await fetch(GEO_IP_URL(ip));
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (data.status !== 'success') return null;
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function appendLog(entry) {
+  try {
+    await fs.mkdir('./logs', { recursive: true });
+    let existing = [];
+    try {
+      const txt = await fs.readFile(LOGS_PATH, 'utf8');
+      existing = JSON.parse(txt || '[]');
+    } catch (e) {
+      existing = [];
+    }
+    existing.unshift(entry);
+    // Keep latest 1000 records to avoid unbounded growth
+    await fs.writeFile(LOGS_PATH, JSON.stringify(existing.slice(0, 1000), null, 2), 'utf8');
+  } catch (e) {
+    console.error('Failed to write log', e);
+  }
+}
+
+async function forwardLog(entry) {
+  const forwardUrl = (process.env.LOG_FORWARD_URL || '').trim();
+  if (!forwardUrl) return;
+  try {
+    const url = forwardUrl; // send to full url configured by user
+    const headers = { 'Content-Type': 'application/json' };
+    if (process.env.LOG_FORWARD_KEY) headers['x-log-forward-key'] = process.env.LOG_FORWARD_KEY;
+    // best-effort, do not block main response if fails
+    await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(entry),
+      // short timeout by racing with a timer
+    });
+  } catch (e) {
+    console.error('Forwarding log failed', e);
+  }
+}
+
 export default async function handler(req, res) {
   // 1. Validasi Method
   if (req.method !== 'POST') {
@@ -72,70 +141,38 @@ export default async function handler(req, res) {
       // Jika error koneksi, lanjut coba key berikutnya
     }
   }
-
+  
   // 5. Kirim Response Akhir ke User
   if (success && finalData) {
-    // Ambil IP klien
-    function getClientIp(req) {
-      const xff = req.headers['x-forwarded-for'] || req.headers['X-Forwarded-For'];
-      if (xff) return xff.split(',')[0].trim();
-      return (req.connection && req.connection.remoteAddress) || (req.socket && req.socket.remoteAddress) || (req.ip) || null;
-    }
-
-    async function geolocateIp(ip) {
-      if (!ip) return null;
-      try {
-        const r = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,message,lat,lon,city,regionName,country,query`);
-        const j = await r.json();
-        if (j && j.status === 'success') return j;
-        return null;
-      } catch (e) {
-        console.error('geolocate error', e);
-        return null;
-      }
-    }
-
-    // Dapatkan IP & geolokasi (jika tersedia)
-    const clientIp = getClientIp(req);
-    const geo = await geolocateIp(clientIp).catch(() => null);
-
-    // Ambil teks jawaban dari struktur response
-    let answerText = '';
+    // Try to log the request and response asynchronously (await so it's attempted)
     try {
-      if (finalData.output && typeof finalData.output === 'string') answerText = finalData.output;
-      else if (finalData.candidates && finalData.candidates[0] && finalData.candidates[0].content) answerText = finalData.candidates[0].content;
-      else answerText = JSON.stringify(finalData).slice(0, 2000);
+      const ip = getRequesterIp(req);
+      const geo = await lookupGeo(ip).catch(() => null);
+      const entry = {
+        id: makeId(),
+        timestamp: new Date().toISOString(),
+        ip: ip || null,
+        network: {
+          userAgent: req.headers['user-agent'] || null,
+          via: req.headers['via'] || null,
+          forwarded: req.headers['forwarded'] || null,
+          referer: req.headers['referer'] || req.headers['referrer'] || null
+        },
+        geo: geo || null,
+        provider: (geo && (geo.isp || geo.org)) || null,
+        request: {
+          contents
+        },
+        responseSummary: {
+          // store a small reference to the returned object (not entire blob)
+          truncated: JSON.stringify(finalData).slice(0, 1000)
+        }
+      };
+      await appendLog(entry);
+      // forward to remote logs receiver (best-effort)
+      await forwardLog(entry);
     } catch (e) {
-      answerText = JSON.stringify(finalData).slice(0, 2000);
-    }
-
-    // Build payload
-    const payload = {
-      timestamp: new Date().toISOString(),
-      ip: clientIp || undefined,
-      lat: geo?.lat,
-      lon: geo?.lon,
-      city: geo?.city,
-      region: geo?.regionName,
-      country: geo?.country,
-      question: typeof contents === 'string' ? contents : JSON.stringify(contents),
-      answer: answerText
-    };
-
-    // Fire-and-forget forwarding to external webhook (set WEBHOOK_URL env to e.g. https://logswormhistory.vercel.app/api/logs)
-    try {
-      const webhook = process.env.WEBHOOK_URL;
-      if (webhook) {
-        fetch(webhook, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        }).then(r => {
-          if (!r.ok) console.warn('Webhook forward failed', r.status);
-        }).catch(e => console.error('Webhook forward error', e));
-      }
-    } catch (e) {
-      console.error('forward try error', e);
+      console.error('Logging failed', e);
     }
 
     return res.status(200).json(finalData);
@@ -148,3 +185,4 @@ export default async function handler(req, res) {
     });
   }
 }
+
